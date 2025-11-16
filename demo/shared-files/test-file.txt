@@ -1,0 +1,11 @@
+Hello from Rondevu WebTorrent Demo!
+
+This is a test file being shared via WebTorrent with Rondevu peer discovery.
+
+Rondevu uses WebRTC signaling to help peers discover each other and establish
+direct peer-to-peer connections for file sharing.
+
+This demo shows how the @xtr-dev/rondevu-webtorrent package can be used to
+enhance WebTorrent with additional peer discovery capabilities.
+
+Happy file sharing!

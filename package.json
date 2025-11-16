@@ -1,0 +1,46 @@
+{
+  "name": "@xtr-dev/rondevu-webtorrent",
+  "version": "0.0.1",
+  "description": "WebTorrent peer discovery plugin using Rondevu WebRTC signaling",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "demo:seed": "npm run build && node demo/seed.mjs",
+    "demo:leech": "npm run build && node demo/leech.mjs"
+  },
+  "keywords": [
+    "webtorrent",
+    "rondevu",
+    "webrtc",
+    "peer-discovery",
+    "bittorrent",
+    "p2p"
+  ],
+  "author": "XTR Development",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xtr-dev/rondevu-webtorrent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xtr-dev/rondevu-webtorrent/issues"
+  },
+  "homepage": "https://github.com/xtr-dev/rondevu-webtorrent#readme",
+  "dependencies": {
+    "@roamhq/wrtc": "^0.9.1",
+    "@xtr-dev/rondevu-client": "^0.7.4",
+    "webtorrent": "^2.8.4"
+  },
+  "devDependencies": {
+    "@types/webtorrent": "^0.110.1",
+    "typescript": "^5.5.3"
+  }
+}
