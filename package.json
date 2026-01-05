@@ -37,6 +37,7 @@
   "dependencies": {
     "@roamhq/wrtc": "^0.9.1",
     "@xtr-dev/rondevu-client": "^0.21.3",
+    "simple-peer": "^9.11.1",
     "webtorrent": "^2.8.4"
   },
   "devDependencies": {

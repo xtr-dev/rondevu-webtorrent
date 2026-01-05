@@ -1,5 +1,6 @@
 import WebTorrent from 'webtorrent';
 import { Rondevu, OfferHandle, Peer } from '@xtr-dev/rondevu-client';
+import { EventEmitter } from 'events';
 
 /**
  * Credential type for rondevu authentication
@@ -30,6 +31,93 @@ class NodeWebRTCAdapter {
   createIceCandidate(candidateInit: RTCIceCandidateInit): RTCIceCandidate {
     return new this.polyfills.RTCIceCandidate(candidateInit);
   }
+}
+
+/**
+ * SimplePeer-compatible wrapper for RTCPeerConnection + DataChannel
+ * WebTorrent expects a SimplePeer-like interface with EventEmitter methods
+ */
+class SimplePeerWrapper extends EventEmitter {
+  public _pc: RTCPeerConnection;
+  public _channel: RTCDataChannel | null;
+  public connected: boolean = false;
+  public destroyed: boolean = false;
+  public remoteAddress?: string;
+  public remotePort?: number;
+
+  constructor(pc: RTCPeerConnection, channel: RTCDataChannel | null) {
+    super();
+    this._pc = pc;
+    this._channel = channel;
+
+    this.setupPeerConnection();
+    if (channel) {
+      this.setupDataChannel(channel);
+    }
+  }
+
+  private setupPeerConnection(): void {
+    this._pc.oniceconnectionstatechange = () => {
+      const state = this._pc.iceConnectionState;
+      if (state === 'connected' || state === 'completed') {
+        this.connected = true;
+        this.emit('connect');
+      } else if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+        this.connected = false;
+        this.emit('close');
+      }
+    };
+
+    this._pc.ondatachannel = (event) => {
+      this.setupDataChannel(event.channel);
+    };
+  }
+
+  private setupDataChannel(channel: RTCDataChannel): void {
+    this._channel = channel;
+
+    channel.onopen = () => {
+      this.connected = true;
+      this.emit('connect');
+    };
+
+    channel.onclose = () => {
+      this.emit('close');
+    };
+
+    channel.onerror = (err) => {
+      this.emit('error', err);
+    };
+
+    channel.onmessage = (event) => {
+      this.emit('data', event.data);
+    };
+  }
+
+  send(data: string | ArrayBuffer | Blob | ArrayBufferView): void {
+    if (this._channel && this._channel.readyState === 'open') {
+      this._channel.send(data as any);
+    }
+  }
+
+  destroy(err?: Error): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.connected = false;
+
+    if (this._channel) {
+      try { this._channel.close(); } catch {}
+    }
+    try { this._pc.close(); } catch {}
+
+    if (err) {
+      this.emit('error', err);
+    }
+    this.emit('close');
+  }
+
+  // Alias for compatibility
+  get conn() { return this._pc; }
 }
 
 /**
@@ -258,8 +346,10 @@ export class RondevuConnectionManager {
             // Add the WebRTC peer connection to the torrent
             try {
               const pc = connection.getPeerConnection();
+              const dc = connection.getDataChannel();
               if (pc) {
-                (torrent as any).addPeer(pc);
+                const wrapper = new SimplePeerWrapper(pc, dc);
+                (torrent as any).addPeer(wrapper);
                 this.log(`Added incoming peer to torrent ${infoHash}`);
               }
             } catch (error) {
@@ -302,8 +392,10 @@ export class RondevuConnectionManager {
             // Add the WebRTC peer connection to the torrent
             try {
               const pc = peer.peerConnection;
+              const dc = peer.dataChannel;
               if (pc) {
-                (torrent as any).addPeer(pc);
+                const wrapper = new SimplePeerWrapper(pc, dc);
+                (torrent as any).addPeer(wrapper);
               }
             } catch (error) {
               this.log(`Failed to add WebRTC peer to torrent: ${error}`);
