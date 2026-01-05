@@ -1,6 +1,6 @@
 {
   "name": "@xtr-dev/rondevu-webtorrent",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "WebTorrent peer discovery plugin using Rondevu WebRTC signaling",
   "type": "module",
   "main": "dist/index.js",
