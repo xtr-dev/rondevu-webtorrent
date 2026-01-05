@@ -1,7 +1,7 @@
 import WebTorrent from 'webtorrent';
 import { RondevuConnectionManager } from './RondevuConnectionManager.js';
 
-export { RondevuConnectionManager, RondevuConnectionManagerOptions } from './RondevuConnectionManager.js';
+export { RondevuConnectionManager, RondevuConnectionManagerOptions, Credential, WebRTCPolyfill } from './RondevuConnectionManager.js';
 
 // Example usage
 // Check if this file is being run directly (not imported)

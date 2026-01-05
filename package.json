@@ -36,7 +36,7 @@
   "homepage": "https://github.com/xtr-dev/rondevu-webtorrent#readme",
   "dependencies": {
     "@roamhq/wrtc": "^0.9.1",
-    "@xtr-dev/rondevu-client": "^0.7.4",
+    "@xtr-dev/rondevu-client": "file:../rondevu-client",
     "webtorrent": "^2.8.4"
   },
   "devDependencies": {

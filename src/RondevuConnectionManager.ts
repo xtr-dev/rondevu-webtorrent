@@ -1,13 +1,35 @@
 import WebTorrent from 'webtorrent';
-import { Rondevu, Credentials, RondevuPeer, BloomFilter } from '@xtr-dev/rondevu-client';
+import { Rondevu, OfferHandle, Peer } from '@xtr-dev/rondevu-client';
+
+/**
+ * Credential type for rondevu authentication
+ */
+export interface Credential {
+  name: string;
+  secret: string;
+}
 
 /**
  * WebRTC polyfill interface for Node.js environments
  */
 export interface WebRTCPolyfill {
   RTCPeerConnection: typeof RTCPeerConnection;
-  RTCSessionDescription: typeof RTCSessionDescription;
   RTCIceCandidate: typeof RTCIceCandidate;
+}
+
+/**
+ * Simple WebRTC adapter for Node.js using wrtc polyfill
+ */
+class NodeWebRTCAdapter {
+  constructor(private polyfills: WebRTCPolyfill) {}
+
+  createPeerConnection(config?: RTCConfiguration): RTCPeerConnection {
+    return new this.polyfills.RTCPeerConnection(config);
+  }
+
+  createIceCandidate(candidateInit: RTCIceCandidateInit): RTCIceCandidate {
+    return new this.polyfills.RTCIceCandidate(candidateInit);
+  }
 }
 
 /**
@@ -42,7 +64,7 @@ export interface RondevuConnectionManagerOptions {
   /**
    * Existing rondevu credentials to reuse
    */
-  credentials?: Credentials;
+  credential?: Credential;
 
   /**
    * WebRTC polyfill for Node.js (e.g., @roamhq/wrtc)
@@ -58,16 +80,16 @@ export interface RondevuConnectionManagerOptions {
  */
 export class RondevuConnectionManager {
   private client: WebTorrent.Instance;
-  private rondevu: Rondevu;
-  private torrentPeers: Map<string, Set<RondevuPeer>> = new Map();
-  private torrentOffers: Map<string, string[]> = new Map();
+  private rondevu: Rondevu | null = null;
+  private torrentOfferHandles: Map<string, OfferHandle> = new Map();
+  private torrentPeers: Map<string, Set<Peer>> = new Map();
   private torrentCleanupHandlers: Map<string, () => void> = new Map();
   private refreshTimers: Map<string, NodeJS.Timeout> = new Map();
-  private torrentBloomFilters: Map<string, BloomFilter> = new Map();
-  private options: Required<Omit<RondevuConnectionManagerOptions, 'credentials' | 'rondevuServer' | 'rtcConfig' | 'wrtc'>> & {
+  private options: Required<Omit<RondevuConnectionManagerOptions, 'credential' | 'rondevuServer' | 'rtcConfig' | 'wrtc'>> & {
     rondevuServer?: string;
     rtcConfig?: RTCConfiguration;
     wrtc?: WebRTCPolyfill;
+    credential?: Credential;
   };
 
   constructor(
@@ -82,34 +104,41 @@ export class RondevuConnectionManager {
       refreshInterval: options.refreshInterval ?? 30000,
       rtcConfig: options.rtcConfig,
       wrtc: options.wrtc,
+      credential: options.credential,
     };
-
-    this.rondevu = new Rondevu({
-      baseUrl: options.rondevuServer,
-      credentials: options.credentials,
-      RTCPeerConnection: options.wrtc?.RTCPeerConnection,
-      RTCSessionDescription: options.wrtc?.RTCSessionDescription,
-      RTCIceCandidate: options.wrtc?.RTCIceCandidate,
-    });
 
     this.initialize();
   }
 
   /**
-   * Initialize the connection manager by setting up event listeners and registering with rondevu
+   * Initialize the connection manager by setting up event listeners and connecting to rondevu
    */
   private async initialize(): Promise<void> {
     this.log('Initializing RondevuConnectionManager');
 
     try {
-      if (!this.rondevu.isAuthenticated()) {
-        const credentials = await this.rondevu.register();
-        this.log(`Registered with rondevu: ${credentials.peerId}`);
-      } else {
-        this.log(`Using existing credentials: ${this.rondevu.getCredentials()?.peerId}`);
+      // Build connection options
+      const connectOptions: Parameters<typeof Rondevu.connect>[0] = {
+        apiUrl: this.options.rondevuServer,
+        credential: this.options.credential,
+        debug: this.options.debug,
+      };
+
+      // Add WebRTC adapter if wrtc polyfill provided
+      if (this.options.wrtc) {
+        connectOptions.webrtcAdapter = new NodeWebRTCAdapter(this.options.wrtc);
       }
+
+      // Add ICE servers if custom config provided
+      if (this.options.rtcConfig?.iceServers) {
+        connectOptions.iceServers = this.options.rtcConfig.iceServers;
+      }
+
+      // Connect to rondevu (auto-generates credentials if not provided)
+      this.rondevu = await Rondevu.connect(connectOptions);
+      this.log(`Connected to rondevu as: ${this.rondevu.getName()}`);
     } catch (error) {
-      this.log(`Failed to register with rondevu: ${error}`);
+      this.log(`Failed to connect to rondevu: ${error}`);
       return;
     }
 
@@ -128,13 +157,16 @@ export class RondevuConnectionManager {
    * Handle a torrent being added to the WebTorrent client
    */
   private async handleTorrentAdded(torrent: WebTorrent.Torrent): Promise<void> {
+    if (!this.rondevu) {
+      this.log('Rondevu not initialized, skipping torrent');
+      return;
+    }
+
     const infoHash = torrent.infoHash;
     this.log(`Torrent added: ${infoHash}`);
 
     // Initialize tracking for this torrent
     this.torrentPeers.set(infoHash, new Set());
-    this.torrentOffers.set(infoHash, []);
-    this.torrentBloomFilters.set(infoHash, new BloomFilter(1024, 3));
 
     // Start discovering peers and creating offers
     await this.discoverPeersForTorrent(torrent);
@@ -156,6 +188,13 @@ export class RondevuConnectionManager {
         this.refreshTimers.delete(infoHash);
       }
 
+      // Cancel our offer for this torrent
+      const offerHandle = this.torrentOfferHandles.get(infoHash);
+      if (offerHandle) {
+        offerHandle.cancel();
+        this.torrentOfferHandles.delete(infoHash);
+      }
+
       // Close all peer connections for this torrent
       const peers = this.torrentPeers.get(infoHash);
       if (peers) {
@@ -168,22 +207,6 @@ export class RondevuConnectionManager {
         });
         this.torrentPeers.delete(infoHash);
       }
-
-      // Delete our offers for this torrent
-      const offerIds = this.torrentOffers.get(infoHash);
-      if (offerIds) {
-        offerIds.forEach(async (offerId) => {
-          try {
-            await this.rondevu.offers.delete(offerId);
-          } catch (error) {
-            this.log(`Error deleting offer: ${error}`);
-          }
-        });
-        this.torrentOffers.delete(infoHash);
-      }
-
-      // Clean up bloom filter
-      this.torrentBloomFilters.delete(infoHash);
 
       this.torrentCleanupHandlers.delete(infoHash);
     };
@@ -202,6 +225,8 @@ export class RondevuConnectionManager {
    * Discover peers for a torrent using rondevu
    */
   private async discoverPeersForTorrent(torrent: WebTorrent.Torrent): Promise<void> {
+    if (!this.rondevu) return;
+
     const infoHash = torrent.infoHash;
     const currentPeerCount = this.torrentPeers.get(infoHash)?.size ?? 0;
 
@@ -212,103 +237,95 @@ export class RondevuConnectionManager {
     }
 
     try {
-      // Create our own offer for this torrent using rondevu.createPeer() to get WebRTC polyfills
-      const peer = this.rondevu.createPeer(this.options.rtcConfig);
+      // Create offers for this torrent if we haven't already
+      if (!this.torrentOfferHandles.has(infoHash)) {
+        this.log(`Creating offers for torrent ${infoHash}`);
 
-      this.log(`Creating offer for torrent ${infoHash}`);
-      const offerId = await peer.createOffer({
-        topics: [infoHash],
-        ttl: 300000, // 5 minutes in milliseconds
-        createDataChannel: true,
-        dataChannelLabel: 'webtorrent',
-      });
+        const offerHandle = await this.rondevu.offer({
+          tags: [infoHash],
+          maxOffers: 3, // Maintain pool of 3 offers
+          ttl: 300000, // 5 minutes
+          autoStart: true,
+        });
 
-      this.torrentOffers.get(infoHash)?.push(offerId);
+        this.torrentOfferHandles.set(infoHash, offerHandle);
 
-      // Set up peer connection handlers
-      this.setupPeerHandlers(peer, torrent, true);
+        // Listen for incoming connections on our offers
+        this.rondevu.on('connection:opened', (_offerId, connection) => {
+          this.log(`Incoming connection for torrent ${infoHash}`);
+
+          connection.on('connected', () => {
+            // Add the WebRTC peer connection to the torrent
+            try {
+              const pc = connection.getPeerConnection();
+              if (pc) {
+                (torrent as any).addPeer(pc);
+                this.log(`Added incoming peer to torrent ${infoHash}`);
+              }
+            } catch (error) {
+              this.log(`Failed to add incoming peer: ${error}`);
+            }
+          });
+        });
+      }
 
       // Discover other peers' offers for this torrent
       this.log(`Discovering peers for torrent ${infoHash}`);
-      const bloomFilter = this.torrentBloomFilters.get(infoHash);
-      const offers = await this.rondevu.offers.findByTopic(infoHash, {
+      const result = await this.rondevu.discover([infoHash], {
         limit: this.options.maxPeersPerTorrent - currentPeerCount,
-        bloomFilter: bloomFilter?.toBytes(),
       });
 
-      this.log(`Found ${offers.length} offers for torrent ${infoHash}`);
+      this.log(`Found ${result.offers.length} offers for torrent ${infoHash}`);
 
-      // Connect to discovered peers
-      for (const remoteOffer of offers) {
+      // Connect to discovered peers using the simplified peer() API
+      for (const remoteOffer of result.offers) {
         // Skip our own offers
-        if (remoteOffer.peerId === this.rondevu.getCredentials()?.peerId) {
+        if (remoteOffer.username === this.rondevu.getName()) {
           continue;
         }
-
-        // Skip if already answered
-        if (remoteOffer.answererPeerId) {
-          continue;
-        }
-
-        // Add to bloom filter to avoid rediscovering
-        bloomFilter?.add(remoteOffer.peerId);
 
         try {
-          // Create peer using rondevu.createPeer() to get WebRTC polyfills
-          const answerPeer = this.rondevu.createPeer(this.options.rtcConfig);
+          this.log(`Connecting to peer ${remoteOffer.username} for torrent ${infoHash}`);
 
-          this.log(`Answering offer ${remoteOffer.id} for torrent ${infoHash}`);
-          await answerPeer.answer(remoteOffer.id, remoteOffer.sdp, {
-            topics: [infoHash],
+          const peer = await this.rondevu.peer({
+            tags: [infoHash],
+            username: remoteOffer.username,
           });
 
-          // Set up peer connection handlers
-          this.setupPeerHandlers(answerPeer, torrent, false);
+          // Track this peer
+          this.torrentPeers.get(infoHash)?.add(peer);
+
+          // Set up peer handlers
+          peer.on('open', () => {
+            this.log(`Connected to peer ${peer.peerUsername} for torrent ${infoHash}`);
+
+            // Add the WebRTC peer connection to the torrent
+            try {
+              const pc = peer.peerConnection;
+              if (pc) {
+                (torrent as any).addPeer(pc);
+              }
+            } catch (error) {
+              this.log(`Failed to add WebRTC peer to torrent: ${error}`);
+            }
+          });
+
+          peer.on('close', () => {
+            this.log(`Peer disconnected for torrent ${infoHash}`);
+            this.torrentPeers.get(infoHash)?.delete(peer);
+          });
+
+          peer.on('error', (error: Error) => {
+            this.log(`Peer error for torrent ${infoHash}: ${error.message}`);
+            this.torrentPeers.get(infoHash)?.delete(peer);
+          });
         } catch (error) {
-          this.log(`Failed to answer offer ${remoteOffer.id}: ${error}`);
+          this.log(`Failed to connect to peer ${remoteOffer.username}: ${error}`);
         }
       }
     } catch (error) {
       this.log(`Error discovering peers for ${infoHash}: ${error}`);
     }
-  }
-
-  /**
-   * Set up event handlers for a rondevu peer
-   */
-  private setupPeerHandlers(
-    peer: RondevuPeer,
-    torrent: WebTorrent.Torrent,
-    isOfferer: boolean
-  ): void {
-    const infoHash = torrent.infoHash;
-
-    peer.on('connected', () => {
-      this.log(`Peer connected for torrent ${infoHash}`);
-      this.torrentPeers.get(infoHash)?.add(peer);
-
-      // Add the WebRTC peer connection to the torrent
-      // WebTorrent can use WebRTC peer connections directly
-      try {
-        (torrent as any).addPeer(peer.pc);
-      } catch (error) {
-        this.log(`Failed to add WebRTC peer to torrent: ${error}`);
-      }
-    });
-
-    peer.on('disconnected', () => {
-      this.log(`Peer disconnected for torrent ${infoHash}`);
-      this.torrentPeers.get(infoHash)?.delete(peer);
-    });
-
-    peer.on('failed', (error: Error) => {
-      this.log(`Peer failed for torrent ${infoHash}: ${error.message}`);
-      this.torrentPeers.get(infoHash)?.delete(peer);
-    });
-
-    peer.on('datachannel', (channel: RTCDataChannel) => {
-      this.log(`Data channel opened for torrent ${infoHash}: ${channel.label}`);
-    });
   }
 
   /**
@@ -343,17 +360,17 @@ export class RondevuConnectionManager {
 
     return {
       activeTorrents: this.client.torrents.length,
-      peerId: this.rondevu.getCredentials()?.peerId,
+      username: this.rondevu?.getName(),
       rondevuServer: this.options.rondevuServer ?? 'https://api.ronde.vu',
       torrents: torrentStats,
     };
   }
 
   /**
-   * Get the rondevu credentials for persistence
+   * Get the rondevu credential for persistence
    */
-  public getCredentials(): Credentials | undefined {
-    return this.rondevu.getCredentials();
+  public getCredential(): Credential | undefined {
+    return this.rondevu?.getCredential();
   }
 
   /**
@@ -367,8 +384,7 @@ export class RondevuConnectionManager {
     this.torrentCleanupHandlers.clear();
 
     this.torrentPeers.clear();
-    this.torrentOffers.clear();
+    this.torrentOfferHandles.clear();
     this.refreshTimers.clear();
-    this.torrentBloomFilters.clear();
   }
 }
